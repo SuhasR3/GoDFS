@@ -1,0 +1,2 @@
+protoc namenode.proto --go_out=paths=source_relative:./proto/namenode --go-grpc_out=paths=source_relative:./proto/namenode --proto_path=./proto/namenode
+protoc datanode.proto --go_out=paths=source_relative:./proto/datanode --go-grpc_out=paths=source_relative:./proto/datanode --proto_path=./proto/datanode
