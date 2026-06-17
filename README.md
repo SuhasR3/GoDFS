@@ -1,8 +1,21 @@
-# GoDFS: Distributed File System in Go
+# GoDFS: Distributed File System
+
+> The core of HDFS, built from scratch in Go. A live cluster of independent services that split files into replicated blocks and coordinate every read and write over gRPC.
 
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go)
+![gRPC](https://img.shields.io/badge/gRPC-Protocol%20Buffers-333333?style=for-the-badge&logo=google)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
-GoDFS is a distributed file system built in Go, modeled on the core architecture of the Hadoop Distributed File System (HDFS). It splits files into fixed size blocks, replicates each block 3x across multiple storage nodes, and uses a central metadata server to track where every block lives. The system has three components: a NameNode for metadata, multiple DataNodes for block storage, and a Client that coordinates reads and writes over gRPC with Protocol Buffers.
+GoDFS is a multi process distributed file system modeled on the architecture of the Hadoop Distributed File System. A central NameNode owns all file metadata. A pool of DataNodes stores file blocks on local disk and reports in every 10 seconds. A client splits each file into fixed size blocks, fans them across three DataNodes in parallel, and records the ordered block layout with the NameNode. Every component is its own process, and all of them talk over gRPC with Protocol Buffers.
+
+---
+
+## What this demonstrates
+
+- **Coordinating state across independent services:** a metadata server, a pool of storage nodes, and a client, each its own gRPC process.
+- **Block replication and load aware placement:** every block is written to three nodes, chosen by a least loaded policy.
+- **Concurrent IO:** writes fan out across blocks and replicas at the same time, then reassemble in order.
+- **Typed service contracts:** schema first gRPC and Protocol Buffers with generated stubs across three service types.
 
 ---
 
@@ -31,31 +44,24 @@ flowchart LR
     NameNode -.->|Tracks block → DataNodes| NameNode
 ```
 
----
-
-## Backend Engineering Highlights
-
-- **Distributed storage architecture** with separate Client, NameNode, and DataNode services.
-- **gRPC and Protocol Buffers** for typed, schema validated communication between services, with generated client and server stubs.
-- **Block based file storage** where files are split into smaller chunks before being written.
-- **3x block replication** across DataNodes.
-- **Concurrent write path** using goroutines and `sync.WaitGroup` at two levels: one goroutine per block, and one goroutine per replica inside each block.
-- **DataNode self registration** with UUID based node identity.
-- **Periodic block reports** from DataNodes to the NameNode every 10 seconds.
-- **Load aware placement** by assigning new blocks to the least loaded available DataNodes.
+The NameNode never touches block bytes. It hands the client a set of target DataNodes, and the client streams block data straight to them. Metadata and data move on separate paths.
 
 ---
 
-## Design Choices
+## Highlights
 
-- **Centralized metadata:** The NameNode stores file to block and DataNode to block mappings in memory, keeping file lookup simple and close to the HDFS model.
-- **Replica based writes:** Each block is written to three DataNodes, separating logical file metadata from physical block storage.
-- **Greedy load balancing:** The NameNode sorts available DataNodes by current block count and chooses the least loaded nodes for new writes.
-- **Local disk block storage:** Each DataNode stores blocks as individual files under its own UUID based directory.
+- **Two level write parallelism.** One goroutine per file block, and one goroutine per replica inside each block, so a three replica write issues all of its RPCs at once.
+- **Scales to a 10 node cluster** with 3x replication on every block.
+- **Load aware placement.** The NameNode sorts available nodes by block count and sends new blocks to the least loaded ones.
+- **Ordered reassembly.** Results from parallel goroutines arrive out of order, get collected over a buffered channel, and are sorted by block index before the layout is committed.
+- **DataNode self registration** with a UUID identity, plus a full block report every 10 seconds to keep metadata current.
+- **gRPC over HTTP/2** with Protocol Buffers and generated client and server stubs.
 
 ---
 
-## Write Path
+## How it works
+
+### Write path
 
 ```mermaid
 sequenceDiagram
@@ -78,11 +84,9 @@ sequenceDiagram
     C->>N: Store ordered file → block mapping
 ```
 
-When writing a file, the client splits it into fixed size blocks and uploads each block in parallel. For every block, the client requests available DataNodes from the NameNode, writes the block to three replicas, then records the final ordered block list with the NameNode.
+The client splits the file into fixed size blocks and uploads them in parallel. For each block it asks the NameNode for three available DataNodes, writes the bytes to all three at once, and collects the results. Once every block is stored, it sends the ordered block layout to the NameNode in a single call.
 
----
-
-## Read Path
+### Read path
 
 ```mermaid
 sequenceDiagram
@@ -97,31 +101,43 @@ sequenceDiagram
     C->>C: Reassemble blocks in order
 ```
 
-When reading a file, the client asks the NameNode for the file's ordered block list and the DataNodes that store each block. The client then fetches one replica per block and reconstructs the file in order.
+To read, the client asks the NameNode for the file's ordered block list and the nodes that hold each block. It fetches one replica per block, then reassembles the blocks in order.
 
 ---
 
-## Tech Stack
+## Design decisions
 
-- **Language:** Go
-- **RPC:** gRPC
-- **Serialization:** Protocol Buffers
-- **Concurrency:** Goroutines, channels, `sync.WaitGroup`
-- **Storage:** Local disk block files
-- **Build:** Makefile
-- **Containerization:** Docker
+- **Centralized in memory metadata.** The NameNode holds the file to block and block to node maps in memory, which keeps lookups simple and mirrors the HDFS model.
+- **Replica based writes.** Each block lands on three DataNodes, separating logical file metadata from physical block storage.
+- **Greedy least loaded placement.** Block count is the placement signal, so new writes go to the emptiest nodes.
+- **gRPC over plain TCP.** Typed, versioned RPC with generated stubs instead of a custom wire format.
+- **Flat block files on local disk.** Each DataNode stores blocks as individual files under its own UUID namespaced directory.
 
 ---
 
-## Run Locally
+## Tech stack
+
+| Area | Choice |
+|---|---|
+| Language | Go 1.21 |
+| RPC | gRPC over HTTP/2 |
+| Serialization | Protocol Buffers |
+| Concurrency | goroutines, channels, `sync.WaitGroup` |
+| Identity | `google/uuid` for node and block IDs |
+| Storage | flat block files on local disk |
+| Build and run | Make, Docker (multi stage build) |
+
+---
+
+## Run it locally
 
 Start the NameNode:
 
 ```bash
-./go-dfs namenode -port 8080 -block-size 32
+./go-dfs namenode -port 8080
 ```
 
-Start DataNodes:
+Start three DataNodes:
 
 ```bash
 ./go-dfs datanode -port 8001 -location datanode-files
@@ -135,7 +151,7 @@ Write a file to the cluster:
 ./go-dfs client -namenode 8080 -operation write -source-path . -filename big.txt
 ```
 
-Read a file from the cluster:
+Read it back:
 
 ```bash
 ./go-dfs client -namenode 8080 -operation read -source-path . -filename big.txt
@@ -143,15 +159,17 @@ Read a file from the cluster:
 
 ---
 
-## Current Scope
+## Roadmap
 
-GoDFS is a local distributed systems prototype. The NameNode stores metadata in memory, and DataNodes persist block files to local disk.
+GoDFS runs as a local cluster today, with metadata held in memory and blocks on local disk. Next:
+
+- **Persistence.** A write ahead log or snapshot so file metadata survives a NameNode restart.
+- **Failure detection.** Heartbeat timeouts so dead DataNodes leave the pool and reads route around them.
+- **Thread safety.** A mutex around the NameNode maps for safe concurrent writes and reports.
+- **TLS.** Encrypted gRPC in place of the current insecure credentials.
 
 ---
 
-## Roadmap
+## Credits
 
-- **NameNode persistence** via a write ahead log or periodic snapshot, so file metadata survives a restart.
-- **DataNode failure detection** via heartbeat timeout, so dead nodes leave the available pool and reads route around them.
-- **Thread safety** with a mutex around the NameNode maps to remove the data race under concurrent writes and block reports.
-- **TLS** on all gRPC connections in place of the current insecure credentials.
+Modeled on the Hadoop Distributed File System. Licensed under MIT.
